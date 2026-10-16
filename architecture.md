@@ -46,3 +46,41 @@ Em conformidade com a Restrição 5.9, todas as invariantes críticas de domíni
 ### 3.3 Máquina de Estados de `WagerTransaction` e Taxonomia de `FailureCode`
 - Estados terminais (`PROCESSED`, `REJECTED`, `FAILED`) são protegidos por `assertNotTerminal()`: qualquer tentativa de mutação posterior lança `InvalidTransactionStateError`.
 - Diferenciação explícita entre falta de saldo numa aposta (`INSUFFICIENT_FUNDS`) e reversão (`ROLLBACK` de `WIN`/`REFUND`) que deixaria a carteira negativa (`REVERSAL_WOULD_CAUSE_NEGATIVE_BALANCE`), atendendo à Regra 9 da Seção 7.
+
+### 3.4 Estratégia de Testes de Domínio (Passo 4)
+- A suíte unitária (`test/unit`) executa via `bun test` sem qualquer dependência de infraestrutura ou mocks de ORM, garantindo feedback em milissegundos sobre aritmética decimal, invariantes da `Wallet`, máquina de estados de `WagerTransaction`, inversão de direção contábil em `ROLLBACK` e determinismo do `payloadHash`.
+
+## 4. Estratégia de Concorrência, Transação Atômica e Paginação (Passo 5)
+
+### 4.1 Concorrência por `walletId` (Pessimistic Write Lock)
+- **Decisão:** Adotamos **Pessimistic Locking ao nível da linha da carteira** (`SELECT ... FROM wallets WHERE id = $1 FOR UPDATE`) dentro de `UnitOfWork.runInTransaction()`, combinado com incremento de `version` e constraints SQL.
+- **Justificativa (Pessimistic vs. Optimistic em Hot Wallets):** Em plataformas de cassino (iGaming), um mesmo jogador ou rodada pode disparar múltiplas transações quase simultâneas sobre a mesma `walletId` (ex.: duas apostas concorrentes ou uma aposta seguida imediatamente de um resultado/rollback). Com *Optimistic Locking*, contendas legítimas geram falhas de versão (`OptimisticLockVersionMismatchError`), exigindo loops de retry na aplicação que aumentam a latência de cauda (p99) e o consumo de conexões. O `SELECT ... FOR UPDATE` no PostgreSQL enfileira e serializa apenas as transações que disputam **a mesma `walletId`**, permitindo que a segunda transação leia imediatamente o saldo atualizado assim que a primeira faz commit (ex.: no cenário de saldo 100 BRL com duas apostas de 80 BRL, a primeira aprova e deixa 20 BRL; a segunda adquire o lock em seguida, lê 20 BRL e rejeita deterministicamente com `INSUFFICIENT_FUNDS`). Operações em carteiras distintas ocorrem 100% em paralelo, sem lock global.
+
+### 4.2 Concorrência nos Workers (Outbox e Pending Reference)
+- Para suportar múltiplas instâncias da aplicação publicando a `Outbox` ou reprocessando `PENDING_REFERENCE` simultaneamente, utilizamos `SELECT ... FOR UPDATE SKIP LOCKED`. Linhas já bloqueadas por uma instância são ignoradas pelas demais, evitando contenção e disparos duplicados concorrentes.
+
+### 4.3 Paginação por Cursor Estável e Opaco no Ledger
+- O endpoint `GET /wallets/:walletId/ledger` utiliza *Keyset Pagination* sobre a tupla `(created_at, id)` codificada em `base64url`. Diferente de `OFFSET/LIMIT`, o cursor é imune a *page drift* e utiliza diretamente o índice composto `idx_ledger_wallet_cursor` em tempo constante $O(\log N)$.
+
+## 5. Casos de Uso, Fluxo Transacional e Idempotência Concorrente (Passo 6)
+
+### 5.1 Ordem de Aquisição de Lock e Prevenção de Race Conditions na Idempotência
+No `ProcessWagerTransactionUseCase`, a ordem das operações dentro da transação SQL foi desenhada especificamente para suportar o cenário de **50 requisições paralelas idênticas** (Seção 13.1) sem gerar falsos erros 500:
+1. Adquire-se **primeiro** o `SELECT ... FOR UPDATE` sobre a linha da `Wallet` (`findByIdForUpdate`).
+2. Com o lock da carteira adquirido, consulta-se a existência da `WagerTransaction` por `idempotency_key` e por `(provider_id, external_transaction_id)`.
+3. **Efeito prático:** Quando 50 requisições idênticas chegam no mesmo milissegundo, a 1ª trava a carteira, processa o débito, grava o `observed_balance` na transação e faz `COMMIT`. As outras 49 requisições, que aguardavam na fila do lock daquela carteira, entram uma a uma, encontram a transação já persistida no passo 2, validam o `payloadHash` e retornam imediatamente `idempotentReplay: true` com o `observed_balance` exato observado no momento da execução original.
+
+### 5.2 Abertura de Carteira (`OPENING`) e Reconciliação
+- Quando uma carteira é aberta com `initialBalance > 0.00`, o sistema gera atomicamente uma transação interna `kind = OPENING` (`PROCESSED`) e o respectivo lançamento `CREDIT` no Ledger. Isso garante que a invariante `wallet.balance == soma(ledger)` seja verdadeira desde o instante zero.
+- O endpoint de reconciliação (`ReconcileWalletUseCase`) recalcula o saldo varrendo todo o histórico do Ledger da carteira e aponta qualquer divergência sem mascará-la ou sobrescrevê-la silenciosamente.
+
+## 6. Camada HTTP e Tratamento Semântico de Exceções (Passo 7)
+
+### 6.1 Mapeamento HTTP Status vs. Erros de Domínio
+O `DomainExceptionFilter` intercepta todas as exceções de domínio e traduz para códigos HTTP semânticos exigidos pelo ecossistema de provedores iGaming:
+- **`200/201 OK/Created`:** Sucesso ou replay idempotente válido.
+- **`400 Bad Request` (`INVALID_PAYLOAD_OR_STATE`):** Erros de formatação de montante, moedas inválidas ou violação de máquina de estados.
+- **`401 Unauthorized`:** Ponto de extensão reservado para o Auth Guard de IdP externo.
+- **`404 Not Found` (`RESOURCE_NOT_FOUND`):** Carteiras ou transações inexistentes.
+- **`409 Conflict` (`IDEMPOTENCY_CONFLICT` / `WALLET_ALREADY_EXISTS`):** Conflito de payload na mesma `Idempotency-Key` ou duplicidade de carteira.
+- **`422 Unprocessable Entity` (Códigos de falha específicos como `INSUFFICIENT_FUNDS`):** Rejeições por regras de negócio onde a requisição é sintaticamente correta, mas inviável no estado financeiro atual.
