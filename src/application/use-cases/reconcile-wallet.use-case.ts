@@ -1,8 +1,9 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { UNIT_OF_WORK, type UnitOfWorkPort } from '../ports/persistence.ports';
 import { Money, MoneyProps } from '../../domain/value-objects/money.vo';
 import { LedgerDirection } from '../../domain/entities/wallet-ledger-entry.entity';
 import { ResourceNotFoundError } from './app-utils';
+import { MetricsService } from '../../infrastructure/observability/metrics.service';
 
 export interface ReconcileWalletResult {
   walletId: string;
@@ -20,6 +21,7 @@ export class ReconcileWalletUseCase {
   constructor(
     @Inject(UNIT_OF_WORK)
     private readonly uow: UnitOfWorkPort,
+    @Optional() private readonly metrics?: MetricsService,
   ) {}
 
   async execute(walletId: string): Promise<ReconcileWalletResult> {
@@ -44,12 +46,11 @@ export class ReconcileWalletUseCase {
       const consistent = difference.isZero();
 
       if (!consistent) {
+        this.metrics?.recordReconciliationDivergence();
+
         this.logger.error({
           message: 'Wallet reconciliation divergence detected!',
           walletId: wallet.id,
-          storedBalance: wallet.balance.toJSON(),
-          calculatedBalance: calculated.toJSON(),
-          difference: difference.toJSON(),
           checkedEntries: entries.length,
         });
       }

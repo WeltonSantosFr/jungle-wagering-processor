@@ -84,3 +84,62 @@ O `DomainExceptionFilter` intercepta todas as exceções de domínio e traduz pa
 - **`404 Not Found` (`RESOURCE_NOT_FOUND`):** Carteiras ou transações inexistentes.
 - **`409 Conflict` (`IDEMPOTENCY_CONFLICT` / `WALLET_ALREADY_EXISTS`):** Conflito de payload na mesma `Idempotency-Key` ou duplicidade de carteira.
 - **`422 Unprocessable Entity` (Códigos de falha específicos como `INSUFFICIENT_FUNDS`):** Rejeições por regras de negócio onde a requisição é sintaticamente correta, mas inviável no estado financeiro atual.
+
+## 7. Processamento Assíncrono via SQS, Inbox Pattern e Graceful Shutdown (Passo 8)
+
+### 7.1 Transactional Inbox e Reentrega Segura (At-Least-Once)
+- O consumidor `WagerSqsConsumer` delega o processamento diretamente para o `ProcessWagerTransactionUseCase`, injetando `inboxContext: { consumerName, messageId }`.
+- O registro em `inbox_messages` é persistido na **mesma transação SQL** da mutação financeira.
+- **Cenário de Crash antes do ACK (Seção 13.5):** Se o processo morrer imediatamente após o `COMMIT` no PostgreSQL mas antes de enviar o `DeleteMessageCommand` (ACK) ao SQS, o broker reentregará a mensagem após o `VisibilityTimeout`. Na reentrega, o Use Case identifica o `messageId` já processado na tabela `inbox_messages` (ou a `idempotency_key` na transação), não aplica nenhum efeito colateral duplicado no saldo/ledger e o consumidor executa o ACK com segurança.
+
+### 7.2 Classificação de Falhas no Consumidor (ACK vs. Retry vs. DLQ)
+- **Violações de Regra de Negócio (ex.: `INSUFFICIENT_FUNDS`):** Tratadas dentro do Use Case como estado terminal `REJECTED` com evento `WagerTransactionRejected` gravado na Outbox. O consumidor executa **ACK** normalmente.
+- **Erros Permanentes (JSON inválido, `InvalidMoneyError`, `IdempotencyConflictError`, `Wallet` inexistente):** Movidos imediatamente para `wager-transactions-dlq.fifo` e confirmados (ACK) na fila principal para não bloquear o `MessageGroupId` da fila FIFO com retentativas fadadas ao fracasso.
+- **Erros Transitórios (indisponibilidade temporária do PostgreSQL):** O consumidor não envia ACK e ajusta o `VisibilityTimeout` com backoff exponencial (`2^receiveCount` segundos), delegando o controle de limite de tentativas (`maxReceiveCount = 3`) para o próprio SQS/DLQ.
+
+### 7.3 Graceful Shutdown (`SIGTERM`)
+- Através do ciclo `OnApplicationShutdown` habilitado por `app.enableShutdownHooks()`, ao receber `SIGTERM` o consumidor interrompe o loop de polling, aguarda a conclusão das transações em voo (`inFlightMessages`) e, caso alguma exceda o tempo limite de desligamento, executa `ChangeMessageVisibility(VisibilityTimeout = 0)` para devolvê-la imediatamente a outro worker ativo.
+
+## 8. Transactional Outbox e Resolução de Referências Fora de Ordem (Passo 9)
+
+### 8.1 Publicação Concorrente Segura da Outbox
+- O `OutboxPublisherWorker` utiliza `SELECT ... FROM outbox_messages WHERE published_at IS NULL AND next_attempt_at <= NOW() ORDER BY occurred_at ASC LIMIT 50 FOR UPDATE SKIP LOCKED`.
+- Cada evento é enviado para a fila `wagering-events.fifo` com `MessageGroupId = aggregateId` (`walletId`) e `MessageDeduplicationId = eventId`.
+- **Resiliência a Crash (Seção 11):** Se uma instância morrer após o commit da aposta mas antes do worker rodar, qualquer outra instância ativa selecionará o registro pendente na varredura seguinte. Se o envio ao SQS falhar temporariamente, `scheduleRetry(now)` aplica backoff exponencial (`min(60s, 1s * 2^attempts)`).
+
+### 8.2 Reprocessamento de `PENDING_REFERENCE` (Seção 7.1)
+- Quando um `REFUND` ou `ROLLBACK` chega antes da transação referenciada (`BET`/`WIN`), ele é persistido como `PENDING_REFERENCE` com `next_retry_at` inicial de 1s e emite o evento `WagerTransactionPendingReference`.
+- O `PendingReferenceWorker` busca registros vencidos usando `FOR UPDATE SKIP LOCKED`. Quando a transação original chega, a reversão é aplicada atomicamente adquirindo o lock da `Wallet`.
+- **TTL / Limite de Tentativas:** Definido em `MAX_RETRIES = 5` com backoff exponencial (`500ms * 2^retryCount`). Ao atingir o limite sem que a referência exista, a transação transiciona para o estado terminal `REJECTED` com `failureCode = REFERENCE_NOT_FOUND_TIMEOUT` e publica `WagerTransactionRejected` na Outbox.
+
+## 9. Observabilidade: Logs Estruturados, Métricas e Health Checks (Passo 10)
+
+### 9.1 Logs Estruturados e Redação de Dados Financeiros
+- O `StructuredJsonLogger` emite logs em formato JSON de linha única contendo `timestamp`, `level`, `context`, `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
+- Um sanitizador automático intercepta e mascara (`[REDACTED_FINANCIAL_DATA]`) chaves como `money`, `balance` e `amount`, garantindo que payloads financeiros completos nunca vazem para o stdout/agregador de logs.
+
+### 9.2 Coleta de Métricas e Diagnóstico (`/metrics`)
+- O `MetricsService` contabiliza em tempo real: `transactionsByStatus`, `duplicatesDetected`, `retriesCount`, `dlqMessagesCount`, `lockOrIdempotencyConflictsCount`, `reconciliationDivergencesCount`, `outboxLag` (consulta em tempo real de eventos não publicados na tabela `outbox_messages`) e percentis de latência (`p50`, `p95`, `p99`).
+
+### 9.3 Separação de Liveness (`/health/live`) e Readiness (`/health/ready`)
+- `/health/live`: Verifica apenas a saúde da event loop do processo Bun/NestJS.
+- `/health/ready`: Executa probes ativos contra o PostgreSQL (`SELECT 1`) e AWS SQS (`ListQueuesCommand`), retornando `503 Service Unavailable` caso qualquer dependência crítica esteja inacessível.
+
+## 10. Autenticação, Trade-offs, Limitações e Teste de Carga (Passo 12)
+
+### 10.1 Desenho de Autenticação com Identity Provider Externo (Seção 2)
+Conforme permitido pela Seção 2 do desafio, a autenticação foi estruturada como ponto de extensão (`AuthGuard` em `src/presentation/http/filters/guards/auth.guard.ts`) sem implementação artesanal de usuários/senhas:
+- **Desenho de Produção (Keycloak / Zitadel):**
+  1. Cada provedor de jogos (`provider-a`, `provider-b`) autentica-se via **OAuth 2.0 Client Credentials Grant** (`client_id` + `client_secret`) junto ao Identity Provider (Keycloak ou Zitadel), recebendo um `Access Token` JWT de curta duração assinado assimetricamente (`RS256` ou `EdDSA`).
+  2. O `AuthGuard` do NestJS valida a assinatura do token consultando o endpoint **JWKS** (`/.well-known/jwks.json`) do IdP com cache local de chaves públicas.
+  3. O claim `sub` / `client_id` do token identifica o provedor autenticado e é confrontado com o `providerId` enviado no payload, impedindo *spoofing* de identidade entre provedores.
+  4. Os endpoints `/health/live` e `/health/ready` permanecem públicos para probes de orquestração, e mensagens oriundas da fila SQS trafegam em VPC/IAM privada, mantendo todas as validações de domínio.
+
+### 10.2 Trade-offs e Limitações Conhecidas
+- **Pessimistic Locking vs. Throughput por Carteira Individual:** O uso de `SELECT ... FOR UPDATE` serializa transações de uma mesma `walletId`. Isso elimina anomalias financeiras e tempestades de retry, mas limita o throughput máximo de uma única carteira específica à latência de round-trip da transação SQL (~2–5ms). Como jogadores humanos não geram centenas de apostas legítimas por segundo na mesma carteira, esse trade-off privilegia correção absoluta sem afetar a escalabilidade horizontal entre carteiras distintas.
+- **Polling de Outbox vs. CDC (Change Data Capture):** O worker de Outbox realiza polling SQL com `FOR UPDATE SKIP LOCKED` a cada 1 segundo. Em cenários de milhões de eventos por minuto, uma evolução natural seria substituir o polling por **Debezium (Logical Replication / WAL do PostgreSQL)**, reduzindo o overhead de leitura no banco.
+- **Métricas In-Memory:** O `MetricsService` armazena contadores e janela deslizante por instância. Em produção multi-instância, os contadores seriam exportados via `prom-client` no formato OpenMetrics para scraping pelo Prometheus.
+
+### 10.3 Metodologia e Análise do Teste de Carga (`bun run test:load`)
+- **Metodologia:** Criam-se 10 carteiras com saldo inicial de `500.00 BRL`. Disparam-se simultaneamente 300 apostas de `20.00 BRL` (30 por carteira, forçando contenção real de lock por carteira e exaustão de saldo nas últimas 5 apostas de cada carteira) seguidas de 50 replays concorrentes da mesma `Idempotency-Key`.
+- **Resultados Observados:** Zero erros `5xx`, exatamente 250 apostas `PROCESSED`, 50 apostas `REJECTED` (`INSUFFICIENT_FUNDS`), 50 replays idempotentes exatos, drenagem completa do *outbox lag* e 100% de consistência na reconciliação final (`wallet.balance == 0.00 == soma(ledger)`).

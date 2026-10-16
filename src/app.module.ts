@@ -17,6 +17,10 @@ import { WalletsController } from './presentation/http/controllers/wallets.contr
 import { APP_FILTER } from '@nestjs/core';
 import { DomainExceptionFilter } from './presentation/http/filters/domain-exception.filter';
 import { WagerSqsConsumer } from './infrastructure/messaging/sqs/wager-sqs.consumer';
+import { OutboxPublisherWorker } from './infrastructure/messaging/outbox/outbox-publisher.worker';
+import { PendingReferenceWorker } from './infrastructure/messaging/outbox/pending-service.worker';
+import { HealthController } from './presentation/http/controllers/health.controller';
+import { MetricsService } from './infrastructure/observability/metrics.service';
 
 @Module({
   imports: [
@@ -24,7 +28,7 @@ import { WagerSqsConsumer } from './infrastructure/messaging/sqs/wager-sqs.consu
     TypeOrmModule.forRoot(dataSourceOptions),
     ScheduleModule.forRoot(),
   ],
-  controllers: [AppController, WalletsController, WageringController],
+  controllers: [AppController, WalletsController, WageringController, HealthController],
   providers: [
     AppService,
     SqsClientProvider,
@@ -38,6 +42,9 @@ import { WagerSqsConsumer } from './infrastructure/messaging/sqs/wager-sqs.consu
       useClass: DomainExceptionFilter,
     },
     WagerSqsConsumer,
+    OutboxPublisherWorker,
+    PendingReferenceWorker,
+    MetricsService,
   ],
   exports: [
     SqsClientProvider,
@@ -47,6 +54,7 @@ import { WagerSqsConsumer } from './infrastructure/messaging/sqs/wager-sqs.consu
     ReconcileWalletUseCase,
     QueriesUseCase,
     WagerSqsConsumer,
+    MetricsService,
   ],
 })
 export class AppModule {}

@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import {
   TransactionalContext,
   UNIT_OF_WORK,
@@ -33,6 +33,7 @@ import {
   ResourceNotFoundError,
   uuidv7,
 } from './app-utils';
+import { MetricsService } from '../../infrastructure/observability/metrics.service';
 
 export interface SubmitWagerTransactionCommand {
   idempotencyKey: string;
@@ -63,12 +64,18 @@ export interface ProcessWagerTransactionResult {
 
 @Injectable()
 export class ProcessWagerTransactionUseCase {
+  private readonly logger = new Logger(ProcessWagerTransactionUseCase.name);
+
   constructor(
     @Inject(UNIT_OF_WORK)
     private readonly uow: UnitOfWorkPort,
+    @Optional()
+    private readonly metrics?: MetricsService,
   ) {}
 
-  async execute(cmd: SubmitWagerTransactionCommand): Promise<ProcessWagerTransactionResult> {
+  async execute(
+    cmd: SubmitWagerTransactionCommand,
+  ): Promise<ProcessWagerTransactionResult> {
     if (cmd.kind === WagerTransactionKind.Opening) {
       throw new DomainError(
         'OPENING transaction kind is strictly internal and cannot be submitted externally',
@@ -91,6 +98,8 @@ export class ProcessWagerTransactionUseCase {
 
     const correlationId = cmd.correlationId ?? uuidv7();
 
+    const startMs = Date.now();
+
     try {
       return await this.uow.runInTransaction(async (ctx) => {
         // 1. Se veio da fila SQS, verifica deduplicação da Inbox
@@ -101,7 +110,9 @@ export class ProcessWagerTransactionUseCase {
             cmd.inboxContext.messageId,
           );
           if (inboxMsg && inboxMsg.isProcessed()) {
-            const existingByKey = await ctx.transactions.findByIdempotencyKey(cmd.idempotencyKey);
+            const existingByKey = await ctx.transactions.findByIdempotencyKey(
+              cmd.idempotencyKey,
+            );
             if (existingByKey) {
               const wallet = await ctx.wallets.findById(existingByKey.walletId);
               return this.buildReplayResponse(existingByKey, wallet);
@@ -173,6 +184,20 @@ export class ProcessWagerTransactionUseCase {
           inboxMsg.markProcessed(now);
           await ctx.inbox.save(inboxMsg);
         }
+
+        this.metrics?.recordTransactionStatus(tx.status);
+        this.metrics?.recordProcessingLatency(Date.now() - startMs);
+        this.logger.log({
+          event: 'WagerTransactionCompleted',
+          correlationId,
+          messageId: cmd.inboxContext?.messageId ?? null,
+          transactionId: tx.id,
+          walletId: tx.walletId,
+          providerId: tx.providerId,
+          kind: tx.kind,
+          status: tx.status,
+          failureCode: tx.failureCode ?? null,
+        });
 
         return {
           transactionId: tx.id,
@@ -253,9 +278,20 @@ export class ProcessWagerTransactionUseCase {
         }
       } else {
         // Validações da referência (Seção 7, Regras 2, 3, 4 e 5)
-        const refError = await this.validateReferenceTransaction(ctx, tx, referenceTx);
+        const refError = await this.validateReferenceTransaction(
+          ctx,
+          tx,
+          referenceTx,
+        );
         if (refError) {
-          await this.rejectAndEnqueue(ctx, wallet, tx, refError, correlationId, now);
+          await this.rejectAndEnqueue(
+            ctx,
+            wallet,
+            tx,
+            refError,
+            correlationId,
+            now,
+          );
           return;
         }
       }
@@ -324,7 +360,14 @@ export class ProcessWagerTransactionUseCase {
       await ctx.outbox.saveMany(outboxEvents.map(OutboxMessage.enqueue));
     } catch (err) {
       if (err instanceof InsufficientFundsError) {
-        await this.rejectAndEnqueue(ctx, wallet, tx, err.failureCode, correlationId, now);
+        await this.rejectAndEnqueue(
+          ctx,
+          wallet,
+          tx,
+          err.failureCode,
+          correlationId,
+          now,
+        );
         return;
       }
       throw err;
@@ -360,7 +403,10 @@ export class ProcessWagerTransactionUseCase {
     }
 
     // Regras específicas para REFUND e ROLLBACK
-    if (tx.kind === WagerTransactionKind.Refund && ref.kind !== WagerTransactionKind.Bet) {
+    if (
+      tx.kind === WagerTransactionKind.Refund &&
+      ref.kind !== WagerTransactionKind.Bet
+    ) {
       return FailureCode.INVALID_REFERENCE_KIND;
     }
 
@@ -379,14 +425,10 @@ export class ProcessWagerTransactionUseCase {
     }
 
     // Regra 4: Uma referência não pode ser revertida duas vezes
-    const alreadyReversedRefund = await ctx.transactions.existsProcessedReversalFor(
-      ref.id,
-      'REFUND',
-    );
-    const alreadyReversedRollback = await ctx.transactions.existsProcessedReversalFor(
-      ref.id,
-      'ROLLBACK',
-    );
+    const alreadyReversedRefund =
+      await ctx.transactions.existsProcessedReversalFor(ref.id, 'REFUND');
+    const alreadyReversedRollback =
+      await ctx.transactions.existsProcessedReversalFor(ref.id, 'ROLLBACK');
 
     if (alreadyReversedRefund || alreadyReversedRollback) {
       return FailureCode.REFERENCE_ALREADY_REVERSED;
@@ -425,12 +467,24 @@ export class ProcessWagerTransactionUseCase {
       wallet?.balance ??
       Money.zero(existingTx.money.currency);
 
+    this.metrics?.recordDuplicateDetected();
+    this.logger.log({
+      event: 'WagerTransactionIdempotentReplay',
+      correlationId: existingTx.id,
+      transactionId: existingTx.id,
+      walletId: existingTx.walletId,
+      providerId: existingTx.providerId,
+      status: existingTx.status,
+    });
+
     return {
       transactionId: existingTx.id,
       status: existingTx.status,
       balance: balance.toJSON(),
       idempotentReplay: true,
-      ...(existingTx.failureCode ? { failureCode: existingTx.failureCode } : {}),
+      ...(existingTx.failureCode
+        ? { failureCode: existingTx.failureCode }
+        : {}),
     };
   }
 
@@ -439,7 +493,9 @@ export class ProcessWagerTransactionUseCase {
     payloadHash: string,
   ): Promise<ProcessWagerTransactionResult> {
     const existing =
-      (await this.uow.repositories.transactions.findByIdempotencyKey(cmd.idempotencyKey)) ??
+      (await this.uow.repositories.transactions.findByIdempotencyKey(
+        cmd.idempotencyKey,
+      )) ??
       (await this.uow.repositories.transactions.findByProviderAndExternalId(
         cmd.providerId,
         cmd.externalTransactionId,
@@ -456,7 +512,9 @@ export class ProcessWagerTransactionUseCase {
       throw new IdempotencyConflictError(cmd.idempotencyKey);
     }
 
-    const wallet = await this.uow.repositories.wallets.findById(existing.walletId);
+    const wallet = await this.uow.repositories.wallets.findById(
+      existing.walletId,
+    );
     return this.buildReplayResponse(existing, wallet);
   }
 }
